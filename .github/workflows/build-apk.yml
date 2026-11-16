@@ -1,96 +1,199 @@
-name: Build Android APK (Pydroid 3 Web)
+name: Xây dựng file APK Android cho Pydroid 3 Web
 
 on:
   push:
     branches: [ main, master ]
-  pull_request:
-    branches: [ main, master ]
   workflow_dispatch:
 
 jobs:
-  build-apk:
-    name: Build Pydroid 3 Android APK
+  build:
+    name: Build Android APK
     runs-on: ubuntu-latest
-    env:
-      ANDROID_HOME: /usr/local/lib/android/sdk
-      ANDROID_SDK_ROOT: /usr/local/lib/android/sdk
 
     steps:
-      - name: 📥 Checkout repository
+      - name: 1. Kiểm tra kho lưu trữ (Checkout)
         uses: actions/checkout@v4
 
-      - name: 🟢 Setup Node.js 22 (Required by Capacitor CLI)
-        uses: actions/setup-node@v4
-        with:
-          node-version: 22
-
-      - name: ☕ Setup Java Development Kit (JDK 21 - Required by Capacitor 8)
+      - name: 2. Cài đặt Java JDK 21 (Bắt buộc cho Capacitor 7 & Gradle 8.14)
         uses: actions/setup-java@v4
         with:
-          distribution: 'temurin'
+          distribution: 'zulu'
           java-version: '21'
 
-      - name: 📋 Accept Android SDK Licenses & Prepare Android SDK
-        run: |
-          mkdir -p "$ANDROID_HOME/licenses" || true
-          echo -e "\n24333f8a63b6825ea9c5514f83c2829b004d1fee\nd56f5187479451eabf01fb78af6dfcb131a6481e" > "$ANDROID_HOME/licenses/android-sdk-license"
-          echo -e "\n84831b9409646a918e30573bab4c9c91346d8abd\n504667f4c0de7af1a06de9f4b1727b816f454d0d" > "$ANDROID_HOME/licenses/android-sdk-preview-license" || true
-          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses 2>/dev/null || true
-          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platforms;android-36" "platforms;android-35" "build-tools;36.0.0" "build-tools;35.0.0" 2>/dev/null || true
+      - name: 3. Cài đặt Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
 
-      - name: 📦 Install Node dependencies
+      - name: 4. Chấp nhận giấy phép Android SDK
+        run: |
+          yes | sdkmanager --licenses || true
+
+      - name: 5. Cài đặt các gói phụ thuộc
         run: |
           npm install --legacy-peer-deps
 
-      - name: 🏗️ Build Web Assets (Vite)
+      - name: 6. Xây dựng các tài nguyên ứng dụng web (npm run build)
+        env:
+          VITE_API_BASE_URL: ${{ secrets.VITE_API_BASE_URL || vars.VITE_API_BASE_URL || '' }}
         run: |
           npm run build
 
-      - name: 📱 Sync Capacitor Android Project
+      - name: 7. Tích hợp và đồng bộ Capacitor Android
         run: |
+          npm install --save-dev --legacy-peer-deps @capacitor/cli@^8 @capacitor/android@^8
+          if [ ! -d "android" ]; then
+            npx cap add android
+          fi
           npx cap sync android
+          if [ -f "public/app-icon.jpg" ]; then
+            python3 -c "import PIL" 2>/dev/null || (sudo apt-get update && sudo apt-get install -y python3-pil)
+            python3 - << 'PYEOF'
+          import os, glob
+          from PIL import Image, ImageDraw
 
-      - name: 🔑 Set gradlew execution permissions
+          res_dir = "android/app/src/main/res"
+          src = Image.open("public/app-icon.jpg").convert("RGBA")
+
+          # Legacy & round mipmaps
+          sizes = {
+              "mipmap-mdpi": (48, 108),
+              "mipmap-hdpi": (72, 162),
+              "mipmap-xhdpi": (96, 216),
+              "mipmap-xxhdpi": (144, 324),
+              "mipmap-xxxhdpi": (192, 432),
+          }
+
+          for f in glob.glob(os.path.join(res_dir, "drawable*", "*ic_launcher*")) + glob.glob(os.path.join(res_dir, "mipmap*", "*ic_launcher*")):
+              try:
+                  os.remove(f)
+              except OSError:
+                  pass
+
+          for folder, (icon_px, fg_px) in sizes.items():
+              out_dir = os.path.join(res_dir, folder)
+              os.makedirs(out_dir, exist_ok=True)
+
+              # Rounded-square legacy icon
+              legacy = src.resize((icon_px, icon_px), Image.Resampling.LANCZOS)
+              mask_sq = Image.new("L", (icon_px, icon_px), 0)
+              ImageDraw.Draw(mask_sq).rounded_rectangle([0, 0, icon_px - 1, icon_px - 1], radius=max(6, icon_px // 5), fill=255)
+              legacy_out = Image.new("RGBA", (icon_px, icon_px), (0, 0, 0, 0))
+              legacy_out.paste(legacy, (0, 0), mask_sq)
+              legacy_out.save(os.path.join(out_dir, "ic_launcher.png"), "PNG")
+
+              # Circular round icon
+              mask_rd = Image.new("L", (icon_px, icon_px), 0)
+              ImageDraw.Draw(mask_rd).ellipse([0, 0, icon_px - 1, icon_px - 1], fill=255)
+              round_out = Image.new("RGBA", (icon_px, icon_px), (0, 0, 0, 0))
+              round_out.paste(legacy, (0, 0), mask_rd)
+              round_out.save(os.path.join(out_dir, "ic_launcher_round.png"), "PNG")
+
+              # Adaptive foreground with safe-zone inset (~68% of 108dp canvas)
+              inner = int(fg_px * 0.68)
+              fg_canvas = Image.new("RGBA", (fg_px, fg_px), (0, 0, 0, 0))
+              fg_scaled = src.resize((inner, inner), Image.Resampling.LANCZOS)
+              offset = (fg_px - inner) // 2
+              fg_canvas.paste(fg_scaled, (offset, offset), fg_scaled)
+              fg_canvas.save(os.path.join(out_dir, "ic_launcher_foreground.png"), "PNG")
+
+          anydpi = os.path.join(res_dir, "mipmap-anydpi-v26")
+          os.makedirs(anydpi, exist_ok=True)
+          adaptive_xml = '''<?xml version="1.0" encoding="utf-8"?>
+          <adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+              <background android:drawable="@color/ic_launcher_background"/>
+              <foreground android:drawable="@mipmap/ic_launcher_foreground"/>
+          </adaptive-icon>
+          '''
+          for name in ("ic_launcher.xml", "ic_launcher_round.xml"):
+              with open(os.path.join(anydpi, name), "w", encoding="utf-8") as fp:
+                  fp.write(adaptive_xml)
+
+          values_dir = os.path.join(res_dir, "values")
+          os.makedirs(values_dir, exist_ok=True)
+          with open(os.path.join(values_dir, "ic_launcher_background.xml"), "w", encoding="utf-8") as fp:
+              fp.write('<?xml version="1.0" encoding="utf-8"?>\n<resources>\n    <color name="ic_launcher_background">#11131a</color>\n</resources>\n')
+          print("Generated custom Android launcher icons successfully.")
+          PYEOF
+          fi
+          node -e '
+            const fs = require("fs");
+            const manifestPath = "android/app/src/main/AndroidManifest.xml";
+            if (fs.existsSync(manifestPath)) {
+              let manifest = fs.readFileSync(manifestPath, "utf8");
+              if (!manifest.includes("android:scheme=\"org.pydroid3.web\"")) {
+                const deepLinkFilter = `            <intent-filter>\n                <action android:name="android.intent.action.VIEW" />\n                <category android:name="android.intent.category.DEFAULT" />\n                <category android:name="android.intent.category.BROWSABLE" />\n                <data android:scheme="org.pydroid3.web" android:host="auth" />\n            </intent-filter>`;
+                manifest = manifest.replace(
+                  /(<activity[^>]*android:name="\.MainActivity"[^>]*>)/,
+                  `$1\n${deepLinkFilter}`
+                );
+                fs.writeFileSync(manifestPath, manifest, "utf8");
+              }
+            }
+            const p = "android/app/src/main/res/values/styles.xml";
+            if (fs.existsSync(p)) {
+              let xml = fs.readFileSync(p, "utf8");
+              if (!xml.includes("android:statusBarColor")) {
+                xml = xml.replace(
+                  /<style name="AppTheme\.NoActionBar"[^>]*>/,
+                  "$&\n        <item name=\"android:statusBarColor\">#11131a</item>\n        <item name=\"android:navigationBarColor\">#10121a</item>"
+                );
+                fs.writeFileSync(p, xml, "utf8");
+              }
+            }
+            const mainAct = "android/app/src/main/java/org/pydroid3/web/MainActivity.java";
+            if (fs.existsSync(mainAct)) {
+              const lines = [
+                "package org.pydroid3.web;",
+                "",
+                "import android.graphics.Color;",
+                "import android.os.Bundle;",
+                "import android.view.View;",
+                "import androidx.core.graphics.Insets;",
+                "import androidx.core.view.ViewCompat;",
+                "import androidx.core.view.WindowCompat;",
+                "import androidx.core.view.WindowInsetsCompat;",
+                "import com.getcapacitor.BridgeActivity;",
+                "",
+                "public class MainActivity extends BridgeActivity {",
+                "    @Override",
+                "    protected void onCreate(Bundle savedInstanceState) {",
+                "        super.onCreate(savedInstanceState);",
+                "        WindowCompat.setDecorFitsSystemWindows(getWindow(), true);",
+                "        getWindow().setStatusBarColor(Color.parseColor(\"#11131a\"));",
+                "        getWindow().setNavigationBarColor(Color.parseColor(\"#10121a\"));",
+                "        View content = findViewById(android.R.id.content);",
+                "        if (content != null) {",
+                "            content.setBackgroundColor(Color.parseColor(\"#11131a\"));",
+                "            ViewCompat.setOnApplyWindowInsetsListener(content, (v, windowInsets) -> {",
+                "                Insets bars = windowInsets.getInsets(WindowInsetsCompat.Type.systemBars());",
+                "                v.setPadding(bars.left, bars.top, bars.right, bars.bottom);",
+                "                return WindowInsetsCompat.CONSUMED;",
+                "            });",
+                "        }",
+                "    }",
+                "}",
+                ""
+              ];
+              fs.writeFileSync(mainAct, lines.join("\n"), "utf8");
+            }
+          '
+
+      - name: 8. Cấp quyền thực thi cho Gradle
         run: |
           chmod +x android/gradlew || true
 
-      - name: 🔨 Build Android Debug APK
+      - name: 9. Xây dựng tệp APK Android
         run: |
-          set -o pipefail
-          cd android
-          chmod +x ./gradlew || true
-          ./gradlew assembleDebug --no-daemon --console=plain --stacktrace 2>&1 | tee build.log
+          cd android && ./gradlew assembleDebug --stacktrace
 
-      - name: 📋 Verify and Prepare APK Artifact
+      - name: 10. Tìm và xác minh tệp APK đã tạo
         run: |
-          mkdir -p output-apk
-          echo "Scanning for built APKs in android directory..."
-          find android -name "*.apk" -print
-          APK_FILE=$(find android -name "*.apk" | head -n 1)
-          if [ -z "$APK_FILE" ]; then
-            echo "❌ ERROR: No APK was found in android directory"
-            if [ -f android/build.log ]; then
-              echo "=== GRADLE BUILD LOG (TAIL) ==="
-              tail -n 120 android/build.log
-            fi
-            exit 1
-          fi
-          echo "Found APK at: $APK_FILE"
-          cp -v "$APK_FILE" output-apk/Pydroid3-Web.apk
-          ls -lh output-apk/
+          ls -la android/app/build/outputs/apk/debug/
 
-      - name: 🚀 Upload APK Artifact (Downloadable from GitHub Actions)
+      - name: 11. Tải lên file APK (Tải xuống trên điện thoại)
         uses: actions/upload-artifact@v4
         with:
-          name: Pydroid3-Web-Android-APK
-          path: output-apk/Pydroid3-Web.apk
-          retention-days: 30
-
-      - name: 🏷️ Create Release with APK (Optional when tagged)
-        if: startsWith(github.ref, 'refs/tags/v')
-        uses: softprops/action-gh-release@v2
-        with:
-          files: output-apk/Pydroid3-Web.apk
-          generate_release_notes: true
-          draft: false
-          prerelease: false
+          name: Pydroid3-Web-Debug-APK
+          path: android/app/build/outputs/apk/debug/*.apk
+          retention-days: 14
